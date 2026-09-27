@@ -1,85 +1,138 @@
-# Module 1 — Data Pipeline (`/data_pipeline`)
+# Module 3 — Support Assistant (`/support_assistant`)
 
-Scrapes books.toscrape.com, cleans the data, converts price to INR at a fixed
-baseline rate, loads it into a normalized SQLite database, and runs SQL +
-pandas queries against it.
+A small RAG service that answers customer questions about Zepto's own
+policies, grounded in an 8-document policy corpus, orchestrated with
+LangGraph, and served over FastAPI.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `scrape.py` | Crawls the homepage sidebar for category links, then scrapes every paginated page of the chosen categories with `requests` + `BeautifulSoup`. Parsing logic is split into small pure functions so it's unit-testable offline. |
-| `clean.py` | Converts `price` → `price_gbp` (float), `star_rating` → `rating` (int 1-5), `availability` → `in_stock` (bool), and computes `price_inr`. |
-| `db.py` | Creates the normalized SQLite schema (`categories` ⟷ `books`, PK/FK) and loads the cleaned data. |
-| `queries.py` | Runs 5 required SQL queries, reads two back with `pd.read_sql`, and reproduces the JOIN query with `pd.merge` (no SQL) to prove equivalence. |
-| `run_pipeline.py` | Orchestrates all of the above end to end. |
-| `tests/test_scrape.py` | Offline pytest suite for the scraper's parsing functions, run against saved HTML fixtures that mirror the live site's markup — verifies the CSS selectors are correct without needing network access. |
+| `docs/doc_01.txt` … `doc_08.txt` | The required policy corpus (delivery, returns, membership, tracking, cancellation, damaged items, gift cards, support hours). |
+| `vectorstore.py` | Chunking (one chunk per doc — all comfortably under the fixed-size fallback threshold), embedding with `sentence-transformers/all-MiniLM-L6-v2`, and a ChromaDB-backed `VectorStore` with cosine-similarity top-k retrieval. |
+| `prompt_template.py` | The structured role → context → task → format → length prompt, with a negative constraint and a few-shot example, used by the optional real-LLM extension. |
+| `schema.py` | Pydantic `AskRequest` / `AskResponse` models and the `GraphState` TypedDict. |
+| `graph.py` | The LangGraph `StateGraph`: `classify_intent` → (conditional edge) → `retrieve_and_answer` **or** `direct_answer`. Every generation step branches on the `MOCK_LLM` env var. |
+| `main.py` | FastAPI app exposing `POST /ask`. |
+| `capture_examples.py` | Captures the 2 required example calls into `example_calls.md`. |
+| `Dockerfile` | Builds + serves the FastAPI app locally on port 7860. |
+| `tests/` | Offline pytest suite (chunking, retrieval, graph routing, FastAPI endpoint) using a deterministic fake embedder — no model download or network access required to run it. |
 
 ## Run it
 
 ```bash
-pip install -r ../requirements.txt      # or the repo's consolidated requirements.txt
-python run_pipeline.py                  # scrape -> clean -> load -> query, all in one go
+pip install -r requirements.txt         # or the repo's consolidated requirements.txt
+
+# 1. Ingest the corpus into ChromaDB (downloads all-MiniLM-L6-v2 on first run)
+python vectorstore.py
+
+# 2. Serve the API (MOCK_LLM defaults to 1 — the graded baseline, no LLM/API key needed)
+uvicorn main:app --host 0.0.0.0 --port 7860
+
+# 3. Call it
+curl -X POST http://localhost:7860/ask \
+     -H "Content-Type: application/json" \
+     -d '{"query": "How much does standard delivery cost?"}'
+
+# Regenerate the recorded example calls for the README:
+python capture_examples.py
 ```
 
-Or step by step:
+Docker:
 
 ```bash
-python scrape.py     # -> books_raw.csv
-python clean.py      # -> books_clean.csv
-python db.py          # -> books.db
-python queries.py     # -> query_results.md
+docker build -t zepto-support-assistant .
+docker run -p 7860:7860 zepto-support-assistant
 ```
 
-Offline sanity check for the scraper's parsing logic (no network needed):
+Offline test suite (no model download needed — uses a deterministic fake embedder):
 
 ```bash
 pytest tests/ -v
 ```
 
-## Design decisions
+## Architecture — the RAG pipeline, stage by stage
 
-- **Category selection**: rather than hardcoding category URLs/IDs (which could
-  drift if the site changes), the scraper reads the homepage's own sidebar to
-  discover category names + URLs, then greedily picks the largest categories
-  until at least 3 are chosen and the running total comfortably clears 60
-  books. In a typical run this lands on categories like *Sequential Art*,
-  *Mystery*, and *Historical Fiction* (~90+ books combined).
-- **Currency conversion**: `price_inr = price_gbp * 105.50`, the project's
-  fixed, keyless baseline rate (not a live/historical lookup — stated here
-  exactly as required). No optional live-rate lookup is implemented, since
-  the required, graded path is the fixed rate alone.
-- **Malformed-row policy**: unparseable `price` → **drop the row** (price is
-  a financial figure; fabricating one via imputation risks materially
-  misleading the INR conversion). Unparseable `rating` → **median-impute**
-  (a coarse 1-5 ordinal signal is a low-risk field to backfill, and doing so
-  keeps the row's otherwise-valid price/availability data usable). In
-  practice, books.toscrape.com's markup is clean and consistent, so neither
-  path is expected to trigger — but both are implemented and logged.
-- **Schema**: two tables, `categories(category_id PK, category_name UNIQUE)`
-  and `books(book_id PK, ..., category_id FK)` — a standard 1-to-many
-  normalization so a category's name is stored once, not repeated per book.
-- **JOIN query**: "10 highest-rated books per category" is implemented with
-  a `ROW_NUMBER() OVER (PARTITION BY category_name ORDER BY rating DESC,
-  price_gbp DESC)` window function, joined against `categories`. The same
-  result is reproduced with `pd.merge` + `groupby(...).head(10)` using the
-  identical tie-break order, and the two DataFrames are compared with
-  `.equals()` to confirm they match exactly.
-- **Politeness**: the scraper sleeps `0.3s` between requests and sets a
-  descriptive `User-Agent`, since books.toscrape.com is a public practice
-  site with no rate-limit API but no need to hammer it either.
+```
+ ingestion            embedding                 retrieval                 generation
+┌──────────┐        ┌──────────────┐        ┌──────────────────┐     ┌────────────────────┐
+│ docs/*.txt│──────▶│ all-MiniLM-L6│──────▶│ ChromaDB          │────▶│ classify_intent     │
+│ (8 files) │  chunk │ -v2 (local)  │ embed  │ collection        │     │ (LangGraph node)    │
+└──────────┘        └──────────────┘        │ 'zepto_policies'  │     └─────────┬───────────┘
+                                             └──────────────────┘               │
+                                                      ▲                conditional edge
+                                                      │                         │
+                                              query embedding          ┌────────┴─────────┐
+                                              (same model)             ▼                  ▼
+                                                      │        retrieve_and_answer   direct_answer
+                                                      │        (top-3 cosine lookup) (no retrieval)
+                                                      └────────────────┘                  │
+                                                               │                          │
+                                                               ▼                          ▼
+                                                        MOCK_LLM branch            MOCK_LLM branch
+                                                     (templated answer OR          (canned string OR
+                                                      real-LLM w/ prompt_template)  real-LLM direct)
+                                                               │                          │
+                                                               └──────────┬───────────────┘
+                                                                          ▼
+                                                                  Pydantic AskResponse
+                                                                  {answer, sources, confidence}
+                                                                          ▼
+                                                                   FastAPI POST /ask
+```
+
+1. **Ingestion** — `vectorstore.load_and_chunk_documents()` reads all 8 `docs/*.txt`
+   files. Given their short length, each document becomes exactly one chunk
+   (id = filename stem, e.g. `doc_01`); a fixed-size fallback split exists
+   for any document that would exceed the length threshold.
+2. **Embedding** — `vectorstore.default_embed_fn()` loads
+   `sentence-transformers/all-MiniLM-L6-v2` once (module-level lazy
+   singleton) and encodes chunk text into normalized vectors, entirely
+   on-machine, no API key.
+3. **Storage** — `VectorStore` wraps a ChromaDB `PersistentClient` /
+   collection named `zepto_policies` (`vectorstore.py`, persisted under
+   `chroma_store/`).
+4. **Retrieval** — `VectorStore.query()` embeds the incoming query with the
+   *same* model and asks ChromaDB for the top-3 nearest chunks by cosine
+   similarity. This step runs identically in both `MOCK_LLM` states — it
+   needs no API key and no network call once the model is cached locally.
+5. **Routing** — the `classify_intent` LangGraph node (keyword heuristic in
+   mock mode) decides `policy_question` vs `general_question`; a conditional
+   edge sends the state to `retrieve_and_answer` or `direct_answer`
+   accordingly. This routing logic is identical regardless of `MOCK_LLM`.
+6. **Generation** — this is the *only* stage that branches on `MOCK_LLM`:
+   - **`MOCK_LLM` unset / `"1"` (default, graded baseline):**
+     `retrieve_and_answer` returns a canned
+     `f"Based on the retrieved context: {top_chunk_snippet}"` string built
+     from the top retrieved chunk; `direct_answer` returns a fixed
+     `"I can only answer questions about Zepto policies right now."` — no
+     LLM call, no network call, in either node.
+   - **`MOCK_LLM=0` (optional, ungraded extension):** the same nodes instead
+     build the structured prompt (`prompt_template.build_prompt`, using the
+     retrieved chunks as context) and call a real LLM; the raw output is
+     validated against `AskResponse` and retried up to 2 more times with a
+     corrective instruction on validation failure (integration point:
+     `_llm_generate_grounded_answer` / `_llm_direct_answer` /
+     `_llm_classify_intent` in `graph.py`, deliberately left as
+     `NotImplementedError` since the graded baseline never calls them).
+7. **Schema enforcement** — in both modes the final state is packed into a
+   Pydantic `AskResponse` (`answer`, `sources`, `confidence`); in mock mode
+   this is populated deterministically in code, so there's no LLM output to
+   fail validation.
+8. **API** — `main.py`'s `POST /ask` accepts an `AskRequest({"query": str})`
+   and returns the validated `AskResponse`.
 
 ## A note on this sandbox
 
-This code was authored and unit-tested here, but the sandbox this was built
-in cannot reach `books.toscrape.com` directly (its network egress is
-restricted to a short allow-list of package registries). The scraper's
-parsing functions (`parse_category_links`, `parse_listing_page`,
-`has_next_page`, `_next_page_url`) were verified against saved HTML fixtures
-that mirror the site's real markup exactly (see `tests/`), and the full
-downstream pipeline (`clean.py` → `db.py` → `queries.py`, including the
-SQL/`pd.merge` equivalence check) was run end-to-end successfully against a
-representative dataset shaped like the real scrape output. Run
-`python run_pipeline.py` on a machine with normal internet access to
-produce the real `books_raw.csv` / `books_clean.csv` / `books.db` from the
-live site.
+The sandbox this was built in cannot reach `huggingface.co` (its network
+egress is restricted to a short package-registry allow-list), so the real
+`all-MiniLM-L6-v2` weights could not be downloaded here. Every other piece
+— chunking, ChromaDB storage/retrieval, the LangGraph graph and its
+conditional routing, the FastAPI endpoint, and Pydantic validation — **was**
+tested end to end here, using a deterministic, dependency-free fake
+embedder swapped in only for tests (`tests/fake_embedder.py`, injected via
+the `embed_fn` parameter `VectorStore` already exposes for this purpose).
+All 10 + 6 tests in `tests/` pass. `example_calls.md` in this folder was
+captured the same way and is clearly labeled — run
+`python capture_examples.py` (no flag) on a machine with normal internet
+access to regenerate it with the real model before submission.
